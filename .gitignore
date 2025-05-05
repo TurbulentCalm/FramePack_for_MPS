@@ -176,3 +176,15 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Cursor related configuration files and subdirectories
+.cursor/
+
+# Project documentation (not tracked by git)
+docs/
+
+# macOS Finder metadata
+.DS_Store
+
+# macOS system files
+.DS_Store

@@ -1,3 +1,74 @@
+# FramePack for MPS
+
+> **Acknowledgment:**  
+> This project is based on the original [FramePack](https://github.com/huggingface/FramePack) app, developed as a demonstration workflow for the FramePack image-to-video model. Special thanks to the Mac fork contributors for their initial adaptation to Apple Silicon.
+
+## Overview
+
+FramePack for MPS is a refactored version of the original FramePack app, optimized to run efficiently on Apple Silicon (Mac) using PyTorch's MPS (Metal Performance Shaders) backend. This project removes all CUDA and Windows-specific dependencies, focusing exclusively on Apple hardware.
+
+## Project Goals
+
+- Full support for Apple Silicon with MPS acceleration.
+- No CUDA or Windows support.
+- CPU fallback available only in debug mode.
+- Improved performance and user experience on Mac.
+
+## Getting Started
+
+> **Note:** This README is a work in progress and will be updated as the project evolves.
+
+### Prerequisites
+
+- macOS with Apple Silicon (M1/M2/M3)
+- [Conda](https://docs.conda.io/en/latest/) for environment management
+- Python 3.x
+- PyTorch with MPS support
+
+### Setup
+
+1. Clone the repository:
+   ```sh
+   git clone <repo-url>
+   cd FramePack_for_MPS
+   ```
+
+2. Create and activate the conda environment:
+   ```sh
+   conda activate framepack
+   ```
+
+3. Install dependencies:
+   ```sh
+   pip install -r requirements.txt
+   ```
+
+### Usage
+
+Instructions for running the app will be added after refactoring for MPS.
+
+## Project Plan
+
+See `docs/project_plan.md` for the detailed project plan and progress.
+
+---
+
+## Acknowledgments
+
+- [FramePack by Hugging Face](https://github.com/huggingface/FramePack)
+- [Mac fork contributors](link-to-fork-if-available)
+- (More details and credits to be added as the project progresses.)
+
+---
+
+## License
+
+[Specify your license here]
+
+---
+
+*This README will be updated as development progresses.*
+
 <p align="center">
     <img src="https://github.com/user-attachments/assets/2cc030b4-87e1-40a0-b5bf-1b7d6b62820b" width="300">
 </p>
@@ -326,7 +397,7 @@ Below are some more examples that you may be interested in reproducing.
 
 <img src="https://github.com/user-attachments/assets/853f4f40-2956-472f-aa7a-fa50da03ed92" width="150">
 
-`The girl suddenly took out a sign that said “cute” using right hand`
+`The girl suddenly took out a sign that said "cute" using right hand`
 
 ![image](https://github.com/user-attachments/assets/d51180e4-5537-4e25-a6c6-faecae28648a)
 

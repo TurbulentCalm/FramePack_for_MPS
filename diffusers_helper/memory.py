@@ -2,68 +2,96 @@
 
 
 import torch
+import psutil
+import logging
 
+logger = logging.getLogger(__name__)
 
 # Detect available devices
 cpu = torch.device('cpu')
-if torch.cuda.is_available():
-    gpu = torch.device(f'cuda:{torch.cuda.current_device()}')
-elif torch.backends.mps.is_available():
+if torch.backends.mps.is_available():
     gpu = torch.device('mps')
 else:
-    raise RuntimeError("No GPU device available. Please use a system with CUDA or MPS support.")
+    gpu = cpu  # Fallback to CPU if MPS not available
+    logger.warning("MPS not available, falling back to CPU")
+
+# Track loaded models
 gpu_complete_modules = []
 
+def get_available_memory_gb():
+    """Get available memory for MPS or system RAM for CPU fallback"""
+    try:
+        if torch.backends.mps.is_available():
+            total_memory = torch.mps.recommended_max_memory()
+            used_memory = torch.mps.driver_allocated_memory()
+            available_memory = total_memory - used_memory
+        else:
+            available_memory = psutil.virtual_memory().available
+        return available_memory / (1024 ** 3)
+    except Exception as e:
+        logger.warning(f"Error getting memory info: {e}")
+        return psutil.virtual_memory().available / (1024 ** 3)
 
+def empty_cache():
+    """Clear MPS memory cache if available"""
+    if torch.backends.mps.is_available():
+        try:
+            torch.mps.empty_cache()
+        except Exception as e:
+            logger.warning(f"Error clearing MPS cache: {e}")
+
+def move_model_to_device(model, target_device):
+    """Move model to specified device and clear cache"""
+    logger.info(f'Moving {model.__class__.__name__} to {target_device}')
+    try:
+        model.to(device=target_device)
+        empty_cache()
+    except Exception as e:
+        logger.error(f"Error moving model to {target_device}: {e}")
+        raise
+
+def offload_model_to_cpu(model):
+    """Offload model to CPU to free up GPU memory"""
+    logger.info(f'Offloading {model.__class__.__name__} to CPU')
+    try:
+        model.to(device=cpu)
+        empty_cache()
+    except Exception as e:
+        logger.error(f"Error offloading model to CPU: {e}")
+        raise
+
+def unload_complete_models(*args):
+    """Unload models from GPU memory"""
+    for m in gpu_complete_modules + list(args):
+        offload_model_to_cpu(m)
+        logger.info(f'Unloaded {m.__class__.__name__} as complete')
+    
+    gpu_complete_modules.clear()
+    empty_cache()
+
+def load_model_as_complete(model, target_device, unload=True):
+    """Load model to device, optionally unloading other models first"""
+    if unload:
+        unload_complete_models()
+    
+    move_model_to_device(model, target_device)
+    logger.info(f'Loaded {model.__class__.__name__} to {target_device} as complete')
+    gpu_complete_modules.append(model)
+
+# Keep DynamicSwapInstaller for compatibility, but simplify it
 class DynamicSwapInstaller:
-    @staticmethod
-    def _install_module(module: torch.nn.Module, **kwargs):
-        original_class = module.__class__
-        module.__dict__['forge_backup_original_class'] = original_class
-
-        def hacked_get_attr(self, name: str):
-            if '_parameters' in self.__dict__:
-                _parameters = self.__dict__['_parameters']
-                if name in _parameters:
-                    p = _parameters[name]
-                    if p is None:
-                        return None
-                    if p.__class__ == torch.nn.Parameter:
-                        return torch.nn.Parameter(p.to(**kwargs), requires_grad=p.requires_grad)
-                    else:
-                        return p.to(**kwargs)
-            if '_buffers' in self.__dict__:
-                _buffers = self.__dict__['_buffers']
-                if name in _buffers:
-                    return _buffers[name].to(**kwargs)
-            return super(original_class, self).__getattr__(name)
-
-        module.__class__ = type('DynamicSwap_' + original_class.__name__, (original_class,), {
-            '__getattr__': hacked_get_attr,
-        })
-
-        return
-
-    @staticmethod
-    def _uninstall_module(module: torch.nn.Module):
-        if 'forge_backup_original_class' in module.__dict__:
-            module.__class__ = module.__dict__.pop('forge_backup_original_class')
-        return
-
+    """Simplified model device management for MPS"""
     @staticmethod
     def install_model(model: torch.nn.Module, **kwargs):
-        for m in model.modules():
-            DynamicSwapInstaller._install_module(m, **kwargs)
-        return
-
+        move_model_to_device(model, kwargs.get('device', gpu))
+    
     @staticmethod
     def uninstall_model(model: torch.nn.Module):
-        for m in model.modules():
-            DynamicSwapInstaller._uninstall_module(m)
-        return
+        offload_model_to_cpu(model)
 
 
 def fake_diffusers_current_device(model: torch.nn.Module, target_device: torch.device):
+    """Ensure model's scale_shift_table is on the correct device"""
     if hasattr(model, 'scale_shift_table'):
         model.scale_shift_table.data = model.scale_shift_table.data.to(target_device)
         return
@@ -74,35 +102,11 @@ def fake_diffusers_current_device(model: torch.nn.Module, target_device: torch.d
             return
 
 
-def get_cuda_free_memory_gb(device=None):
-    if device is None:
-        device = gpu
-
-    if device.type == 'cuda':
-        memory_stats = torch.cuda.memory_stats(device)
-        bytes_active = memory_stats['active_bytes.all.current']
-        bytes_reserved = memory_stats['reserved_bytes.all.current']
-        bytes_free_cuda, _ = torch.cuda.mem_get_info(device)
-        bytes_inactive_reserved = bytes_reserved - bytes_active
-        bytes_total_available = bytes_free_cuda + bytes_inactive_reserved
-    elif device.type == 'mps':
-        # MPS doesn't provide detailed memory stats, return a best guess
-        bytes_total_available = torch.mps.recommended_max_memory() - torch.mps.driver_allocated_memory()
-
-    return bytes_total_available / (1024 ** 3)
-
-
-def empty_cache():
-    if gpu.type == 'cuda':
-        torch.cuda.empty_cache()
-    elif gpu.type == 'mps':
-        torch.mps.empty_cache()
-
 def move_model_to_device_with_memory_preservation(model, target_device, preserved_memory_gb=0):
     print(f'Moving {model.__class__.__name__} to {target_device} with preserved memory: {preserved_memory_gb} GB')
 
     for m in model.modules():
-        if get_cuda_free_memory_gb(target_device) <= preserved_memory_gb:
+        if get_available_memory_gb() <= preserved_memory_gb:
             empty_cache()
             return
 
@@ -119,7 +123,7 @@ def offload_model_from_device_for_memory_preservation(model, target_device, pres
 
     if target_device.type == 'cuda':
         for m in model.modules():
-            if get_cuda_free_memory_gb(target_device) >= preserved_memory_gb:
+            if get_available_memory_gb() >= preserved_memory_gb:
                 empty_cache()
                 return
 
@@ -131,25 +135,4 @@ def offload_model_from_device_for_memory_preservation(model, target_device, pres
 
     model.to(device=cpu)
     empty_cache()
-    return
-
-
-def unload_complete_models(*args):
-    for m in gpu_complete_modules + list(args):
-        m.to(device=cpu)
-        print(f'Unloaded {m.__class__.__name__} as complete.')
-
-    gpu_complete_modules.clear()
-    empty_cache()
-    return
-
-
-def load_model_as_complete(model, target_device, unload=True):
-    if unload:
-        unload_complete_models()
-
-    model.to(device=target_device)
-    print(f'Loaded {model.__class__.__name__} to {target_device} as complete.')
-
-    gpu_complete_modules.append(model)
     return

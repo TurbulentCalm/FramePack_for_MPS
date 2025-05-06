@@ -1,6 +1,5 @@
-from diffusers_helper.hf_login import login
-
 import os
+import psutil
 
 os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
@@ -13,6 +12,7 @@ import safetensors.torch as sf
 import numpy as np
 import argparse
 import math
+import logging
 
 from PIL import Image
 from diffusers import AutoencoderKLHunyuanVideo
@@ -21,14 +21,17 @@ from diffusers_helper.hunyuan import encode_prompt_conds, vae_decode, vae_encode
 from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, soft_append_bcthw, resize_and_center_crop, state_dict_weighted_merge, state_dict_offset_merge, generate_timestamp
 from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
 from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
-from diffusers_helper.memory import cpu, gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, fake_diffusers_current_device, DynamicSwapInstaller, unload_complete_models, load_model_as_complete
+from diffusers_helper.memory import (
+    cpu, gpu, get_available_memory_gb, move_model_to_device,
+    offload_model_to_cpu, unload_complete_models, load_model_as_complete,
+    DynamicSwapInstaller, fake_diffusers_current_device
+)
 from diffusers_helper.thread_utils import AsyncStream, async_run
 from diffusers_helper.gradio.progress_bar import make_progress_bar_css, make_progress_bar_html
-from transformers import SiglipImageProcessor, SiglipVisionModel
-from diffusers_helper.clip_vision import hf_clip_vision_encode
 from diffusers_helper.bucket_tools import find_nearest_bucket
 
 
+# --- New argument parsing: adds --debug and --verbose flags for better control ---
 parser = argparse.ArgumentParser()
 parser.add_argument('--share', action='store_true')
 parser.add_argument("--server", type=str, default='0.0.0.0')
@@ -36,86 +39,190 @@ parser.add_argument("--port", type=int, required=False)
 parser.add_argument("--inbrowser", action='store_true')
 parser.add_argument("--output_dir", type=str, default='./outputs')
 parser.add_argument("--fp32", action='store_true', default=False)
+parser.add_argument("--debug", action='store_true', help="Enable debug mode (allows CPU fallback if MPS unavailable)")
+parser.add_argument("--verbose", action='store_true', help="Enable verbose logging")
 args = parser.parse_args()
 
-# for win desktop probably use --server 127.0.0.1 --inbrowser
-# For linux server probably use --server 127.0.0.1 or do not use any cmd flags
+# --- New logging setup: uses Python's logging module, controlled by --verbose flag ---
+logging.basicConfig(
+    level=logging.DEBUG if args.verbose else logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger(__name__)
 
-print(args)
+logger.info(f"Arguments: {args}")
 
-if torch.cuda.is_available():
-    free_mem_gb = get_cuda_free_memory_gb(gpu)
-else:
+# --- New memory check: Only MPS, fallback guess if not available ---
+try:
     free_mem_gb = torch.mps.recommended_max_memory() / 1024 / 1024 / 1024
+except AttributeError:
+    free_mem_gb = 8  # Fallback guess if not available
 
 high_vram = free_mem_gb > 60
-print(f'Free VRAM {free_mem_gb} GB')
-print(f'High-VRAM Mode: {high_vram}')
+logger.info(f'Free VRAM {free_mem_gb} GB')
+logger.info(f'High-VRAM Mode: {high_vram}')
 
-text_encoder = LlamaModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder', torch_dtype=torch.float16).cpu()
-text_encoder_2 = CLIPTextModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder_2', torch_dtype=torch.float16).cpu()
-tokenizer = LlamaTokenizerFast.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer')
-tokenizer_2 = CLIPTokenizer.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer_2')
-vae = AutoencoderKLHunyuanVideo.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='vae', torch_dtype=torch.float16).cpu()
+# --- New device selection logic: MPS first, CPU fallback only in debug mode, no CUDA support ---
+import torch
+if torch.backends.mps.is_available():
+    device = torch.device("mps")
+    logger.info("Using MPS device")
+elif args.debug:
+    device = torch.device("cpu")
+    logger.warning("MPS not available. Falling back to CPU (debug mode)")
+else:
+    logger.error("MPS device not found. This app requires Apple Silicon with MPS support")
+    raise RuntimeError("MPS device not found")
 
-feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='feature_extractor')
-image_encoder = SiglipVisionModel.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='image_encoder', torch_dtype=torch.float16).cpu()
+# --- Old model loading (commented out) ---
+# text_encoder = LlamaModel.from_pretrained(...).cpu()
 
-transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePackI2V_HY', torch_dtype=torch.bfloat16).cpu()
+# --- New model loading: now loads directly to device ---
+text_encoder = LlamaModel.from_pretrained(
+    "hunyuanvideo-community/HunyuanVideo",
+    subfolder='text_encoder',
+    torch_dtype=torch.float16
+)
+move_model_to_device(text_encoder, device)
+log_full_memory_status(logger)
 
+text_encoder_2 = CLIPTextModel.from_pretrained(
+    "hunyuanvideo-community/HunyuanVideo", 
+    subfolder='text_encoder_2', 
+    torch_dtype=torch.float16
+)
+move_model_to_device(text_encoder_2, device)
+log_full_memory_status(logger)
+
+tokenizer = LlamaTokenizerFast.from_pretrained(
+    "hunyuanvideo-community/HunyuanVideo", 
+    subfolder='tokenizer'
+)
+log_full_memory_status(logger)
+tokenizer_2 = CLIPTokenizer.from_pretrained(
+    "hunyuanvideo-community/HunyuanVideo", 
+    subfolder='tokenizer_2'
+)
+log_full_memory_status(logger)
+
+vae = AutoencoderKLHunyuanVideo.from_pretrained(
+    "hunyuanvideo-community/HunyuanVideo", 
+    subfolder='vae', 
+    torch_dtype=torch.float16
+)
+move_model_to_device(vae, device)
+log_full_memory_status(logger)
+
+# --- The following code for the flux model (lllyasviel/flux_redux_bfl) is commented out pending review for future features ---
+# feature_extractor = SiglipImageProcessor.from_pretrained(
+#     "lllyasviel/flux_redux_bfl", 
+#     subfolder='feature_extractor'
+# )
+# image_encoder = SiglipVisionModel.from_pretrained(
+#     "lllyasviel/flux_redux_bfl", 
+#     subfolder='image_encoder', 
+#     torch_dtype=torch.float16
+# )
+# move_model_to_device(image_encoder, device)
+
+transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained(
+    'lllyasviel/FramePackI2V_HY', 
+    torch_dtype=torch.bfloat16
+)
+move_model_to_device(transformer, device)
+log_full_memory_status(logger)
+
+# --- Model evaluation mode (unchanged, but included for clarity) ---
 vae.eval()
 text_encoder.eval()
 text_encoder_2.eval()
-image_encoder.eval()
+# image_encoder.eval()
 transformer.eval()
 
+# --- Old high_vram slicing/tiling logic (unchanged, but now with comments) ---
 if not high_vram:
     vae.enable_slicing()
     vae.enable_tiling()
 
 transformer.high_quality_fp32_output_for_inference = True
-print('transformer.high_quality_fp32_output_for_inference = True')
+logger.info('transformer.high_quality_fp32_output_for_inference = True')
 
-# For MPS, some processors like M1/M2 may need to use float32
+# --- Old dtype selection logic (no comments, print-based) ---
+# if args.fp32:
+#     print('Using float32 for transformer and encoder models')
+#     transformer.to(dtype=torch.float32)
+#     vae.to(dtype=torch.float32)
+#     image_encoder.to(dtype=torch.float32)
+#     text_encoder.to(dtype=torch.float32)
+#     text_encoder_2.to(dtype=torch.float32)
+
+# --- New dtype selection logic: uses logger, supports --fp32 flag ---
 if args.fp32:
-    print('Using float32 for transformer and encoder models')
-    transformer.to(dtype=torch.float32)
-    vae.to(dtype=torch.float32)
-    image_encoder.to(dtype=torch.float32)
-    text_encoder.to(dtype=torch.float32)
-    text_encoder_2.to(dtype=torch.float32)
+    logger.info('Using float32 for transformer and encoder models')
+    models_to_convert = [transformer, vae]
+    for model in models_to_convert:
+        model.to(dtype=torch.float32)
 else:
     transformer.to(dtype=torch.bfloat16)
     vae.to(dtype=torch.float16)
-    image_encoder.to(dtype=torch.float16)
-    text_encoder.to(dtype=torch.float16)
-    text_encoder_2.to(dtype=torch.float16)
 
-vae.requires_grad_(False)
-text_encoder.requires_grad_(False)
-text_encoder_2.requires_grad_(False)
-image_encoder.requires_grad_(False)
-transformer.requires_grad_(False)
+# --- requires_grad settings (unchanged, but included for clarity) ---
+for model in [vae, text_encoder, text_encoder_2]:
+    model.requires_grad_(False)
 
 if not high_vram:
-    # DynamicSwapInstaller is same as huggingface's enable_sequential_offload but 3x faster
-    DynamicSwapInstaller.install_model(transformer, device=gpu)
-    DynamicSwapInstaller.install_model(text_encoder, device=gpu)
+    DynamicSwapInstaller.install_model(transformer, device=device)
+    DynamicSwapInstaller.install_model(text_encoder, device=device)
 else:
-    text_encoder.to(gpu)
-    text_encoder_2.to(gpu)
-    image_encoder.to(gpu)
-    vae.to(gpu)
-    transformer.to(gpu)
+    text_encoder.to(device)
+    text_encoder_2.to(device)
+    vae.to(device)
+    transformer.to(device)
 
 stream = AsyncStream()
 
 outputs_folder = args.output_dir
 os.makedirs(outputs_folder, exist_ok=True)
 
+# Add a global variable to store debug log messages for the UI
+DEBUG_LOGS = []
+
+def append_debug_log(msg):
+    DEBUG_LOGS.append(msg)
+    if len(DEBUG_LOGS) > 20:
+        DEBUG_LOGS.pop(0)
+
+# Update log_full_memory_status to also update the debug log panel
+
+def log_full_memory_status(logger=None):
+    vm = psutil.virtual_memory()
+    swap = psutil.swap_memory()
+    try:
+        mps_used = torch.mps.driver_allocated_memory() / (1024**3)
+        mps_total = torch.mps.recommended_max_memory() / (1024**3)
+        mps_str = f", MPS: {mps_used:.2f}GB used / {mps_total:.2f}GB total"
+    except Exception:
+        mps_str = ""
+    msg = (
+        f"RAM: {vm.used / (1024**3):.2f}GB used / {vm.total / (1024**3):.2f}GB total "
+        f"({vm.percent}% used), "
+        f"Swap: {swap.used / (1024**3):.2f}GB used / {swap.total / (1024**3):.2f}GB total "
+        f"({swap.percent}% used)" + mps_str
+    )
+    append_debug_log(msg)
+    if logger:
+        logger.info(msg)
+    else:
+        print(msg)
+
+# Add a function to get the latest debug log for the UI
+
+def get_debug_log():
+    return '\n'.join(DEBUG_LOGS)
 
 @torch.no_grad()
 def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, resolution):
+    log_full_memory_status(logger)
     total_latent_sections = (total_second_length * 24) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
 
@@ -124,19 +231,16 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
     stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...'))))
 
     try:
-        # Clean GPU
-        if not high_vram:
-            unload_complete_models(
-                text_encoder, text_encoder_2, image_encoder, vae, transformer
-            )
-
-        # Text encoding
+        # Unload models to manage memory
+        unload_complete_models(
+            text_encoder, text_encoder_2, transformer
+        )
 
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Text encoding ...'))))
 
-        if not high_vram:
-            fake_diffusers_current_device(text_encoder, gpu)
-            load_model_as_complete(text_encoder_2, target_device=gpu)
+        # Load text encoders
+        fake_diffusers_current_device(text_encoder, device)
+        load_model_as_complete(text_encoder_2, target_device=device)
 
         llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
 
@@ -147,8 +251,6 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
         llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
         llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
-
-        # Processing input image
 
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Image processing ...'))))
 
@@ -161,37 +263,23 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         input_image_pt = torch.from_numpy(input_image_np).float() / 127.5 - 1
         input_image_pt = input_image_pt.permute(2, 0, 1)[None, :, None]
 
-        # VAE encoding
-
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'VAE encoding ...'))))
-
-        if not high_vram:
-            load_model_as_complete(vae, target_device=gpu)
 
         start_latent = vae_encode(input_image_pt, vae)
 
-        # CLIP Vision
-
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'CLIP Vision encoding ...'))))
 
-        if not high_vram:
-            load_model_as_complete(image_encoder, target_device=gpu)
-
-        image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
-        image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
-
-        # Dtype
+        # Comment out any use of feature_extractor and image_encoder in the workflow, e.g.:
+        # image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
+        # image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
 
         llama_vec = llama_vec.to(transformer.dtype)
         llama_vec_n = llama_vec_n.to(transformer.dtype)
         clip_l_pooler = clip_l_pooler.to(transformer.dtype)
         clip_l_pooler_n = clip_l_pooler_n.to(transformer.dtype)
-        image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(transformer.dtype)
-
-        # Sampling
 
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Start sampling ...'))))
-
+        log_full_memory_status(logger)
         rnd = torch.Generator("cpu").manual_seed(seed)
         num_frames = latent_window_size * 4 - 3
 
@@ -207,6 +295,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         for latent_padding in latent_paddings:
             is_last_section = latent_padding == 0
             latent_padding_size = latent_padding * latent_window_size
+            log_full_memory_status(logger)
 
             if stream.input_queue.top() == 'end':
                 stream.output_queue.push(('end', None))
@@ -224,7 +313,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
             if not high_vram:
                 unload_complete_models()
-                move_model_to_device_with_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
+                move_model_to_device(transformer, device)
 
             if use_teacache:
                 transformer.initialize_teacache(enable_teacache=True, num_steps=steps)
@@ -266,9 +355,9 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 negative_prompt_embeds=llama_vec_n,
                 negative_prompt_embeds_mask=llama_attention_mask_n,
                 negative_prompt_poolers=clip_l_pooler_n,
-                device=gpu,
+                device=device,
                 dtype=transformer.dtype,
-                image_embeddings=image_encoder_last_hidden_state,
+                image_embeddings=None,
                 latent_indices=latent_indices,
                 clean_latents=clean_latents,
                 clean_latent_indices=clean_latent_indices,
@@ -286,8 +375,8 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             history_latents = torch.cat([generated_latents.to(history_latents), history_latents], dim=2)
 
             if not high_vram:
-                offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=8)
-                load_model_as_complete(vae, target_device=gpu)
+                offload_model_to_cpu(transformer)
+                load_model_as_complete(vae, target_device=device)
 
             real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
 
@@ -313,12 +402,13 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
             if is_last_section:
                 break
+        log_full_memory_status(logger)
     except:
         traceback.print_exc()
 
         if not high_vram:
             unload_complete_models(
-                text_encoder, text_encoder_2, image_encoder, vae, transformer
+                text_encoder, text_encoder_2, transformer
             )
 
     stream.output_queue.push(('end', None))
@@ -379,6 +469,8 @@ with block:
             with gr.Row():
                 start_button = gr.Button(value="Start Generation")
                 end_button = gr.Button(value="End Generation", interactive=False)
+                # Add spinner next to start button
+                spinner = gr.HTML("<div id='spinner' style='display:none'><svg width='24' height='24' viewBox='0 0 24 24'><circle cx='12' cy='12' r='10' stroke='gray' stroke-width='4' fill='none' stroke-dasharray='60' stroke-dashoffset='0'><animateTransform attributeName='transform' type='rotate' from='0 12 12' to='360 12 12' dur='1s' repeatCount='indefinite'/></circle></svg></div>")
 
             with gr.Group():
                 use_teacache = gr.Checkbox(label='Use TeaCache', value=True, info='Faster speed, but often makes hands and fingers slightly worse.')
@@ -405,11 +497,29 @@ with block:
             gr.Markdown('Note that the ending actions will be generated before the starting actions due to the inverted sampling. If the starting action is not in the video, you just need to wait, and it will be generated later.')
             progress_desc = gr.Markdown('', elem_classes='no-generating-animation')
             progress_bar = gr.HTML('', elem_classes='no-generating-animation')
+            # Add debug/status panel below the progress bar
+            debug_panel = gr.Textbox(label="Debug/Status Log", value="", lines=8, interactive=False)
 
     gr.HTML('<div style="text-align:center; margin-top:20px;">Share your results and find ideas at the <a href="https://x.com/search?q=framepack&f=live" target="_blank">FramePack Twitter (X) thread</a></div>')
 
     ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, resolution]
-    start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
+    outs = [result_video, preview_image, progress_desc, progress_bar, start_button, end_button, debug_panel]
+    # Update process and start_button.click to update spinner and debug_panel
+    def process_with_debug(*args):
+        # Show spinner
+        import time
+        spinner_html = "<div id='spinner' style='display:block'><svg width='24' height='24' viewBox='0 0 24 24'><circle cx='12' cy='12' r='10' stroke='gray' stroke-width='4' fill='none' stroke-dasharray='60' stroke-dashoffset='0'><animateTransform attributeName='transform' type='rotate' from='0 12 12' to='360 12 12' dur='1s' repeatCount='indefinite'/></circle></svg></div>"
+        yield [None, None, '', '', gr.update(interactive=False), gr.update(interactive=True), get_debug_log()]
+        # Call the original process function
+        for result in process(*args):
+            # Update debug panel with latest logs
+            debug_log = get_debug_log()
+            # Hide spinner when done
+            if result[0] is not None:
+                spinner_html = "<div id='spinner' style='display:none'></div>"
+            yield list(result) + [debug_log]
+
+    start_button.click(fn=process_with_debug, inputs=ips, outputs=outs)
     end_button.click(fn=end_process)
 
 

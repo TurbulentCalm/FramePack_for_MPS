@@ -182,9 +182,18 @@ cython_debug/
 
 # Project documentation (not tracked by git)
 docs/
+legacy/
+test_data/
 
 # macOS Finder metadata
 .DS_Store
 
 # macOS system files
 .DS_Store
+
+# direnv
+.envrc
+
+# vscode
+.vscode/
+/archive

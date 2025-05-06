@@ -1,73 +1,97 @@
 # FramePack for MPS
 
-> **Acknowledgment:**  
-> This project is based on the original [FramePack](https://github.com/huggingface/FramePack) app, developed as a demonstration workflow for the FramePack image-to-video model. Special thanks to the Mac fork contributors for their initial adaptation to Apple Silicon.
+## Project Overview
 
-## Overview
+FramePack for MPS is a fork and refactor of the original [lllyasviel/FramePack](https://github.com/lllyasviel/FramePack) and [brandon929/FramePack](https://github.com/brandon929/FramePack) repositories. This project is dedicated to optimizing FramePack for Apple Silicon (M1/M2/M3) using PyTorch's MPS backend, removing all CUDA dependencies, and providing a modern, user-friendly interface and robust memory monitoring for macOS users.
 
-FramePack for MPS is a refactored version of the original FramePack app, optimized to run efficiently on Apple Silicon (Mac) using PyTorch's MPS (Metal Performance Shaders) backend. This project removes all CUDA and Windows-specific dependencies, focusing exclusively on Apple hardware.
+## Acknowledgments
 
-## Project Goals
+- **Original Authors:**
+  - [lllyasviel/FramePack](https://github.com/lllyasviel/FramePack) – The official FramePack implementation and research.
+  - [brandon929/FramePack](https://github.com/brandon929/FramePack) – The first major macOS/Apple Silicon adaptation.
+- This project would not be possible without their foundational work and open-source contributions.
 
-- Full support for Apple Silicon with MPS acceleration.
-- No CUDA or Windows support.
-- CPU fallback available only in debug mode.
-- Improved performance and user experience on Mac.
+## What This Fork Changes
 
-## Getting Started
+- **Apple Silicon/MPS Optimization:**
+  - All CUDA-specific code has been removed or replaced with MPS-first logic.
+  - The codebase is now focused on running efficiently on Apple Silicon (M1/M2/M3) with PyTorch's MPS backend.
+- **Memory Monitoring:**
+  - Real-time logging of system RAM, swap, and MPS (GPU) memory usage at key points in the workflow.
+  - Debug/status panel in the Gradio UI for real-time feedback.
+- **User Interface Improvements:**
+  - Activity spinner and enhanced progress feedback in the Gradio UI.
+  - Debug/status panel for transparency during long-running operations.
+- **Code Cleanup & Documentation:**
+  - Unused code and imports removed.
+  - All model loading now uses the default Hugging Face cache.
+  - Comprehensive changelog and TODO tracking.
 
-> **Note:** This README is a work in progress and will be updated as the project evolves.
+## Project Description
 
-### Prerequisites
+FramePack is a next-frame prediction neural network for video generation, designed to efficiently process long videos by compressing input contexts. This fork brings FramePack to Apple Silicon, making it accessible and performant for Mac users, with a focus on transparency, reliability, and ease of use.
+
+## Requirements
 
 - macOS with Apple Silicon (M1/M2/M3)
-- [Conda](https://docs.conda.io/en/latest/) for environment management
-- Python 3.x
+- Python 3.10 (recommended)
+- [Conda](https://docs.conda.io/en/latest/) for environment management (optional but recommended)
 - PyTorch with MPS support
+- Sufficient disk space for model downloads (30GB+)
 
-### Setup
+## Installation
 
-1. Clone the repository:
+1. **Clone the repository:**
    ```sh
    git clone <repo-url>
    cd FramePack_for_MPS
    ```
-
-2. Create and activate the conda environment:
+2. **(Optional) Create and activate a conda environment:**
    ```sh
+   conda create -n framepack python=3.10
    conda activate framepack
    ```
-
-3. Install dependencies:
+3. **Install PyTorch with MPS support:**
+   ```sh
+   pip install --pre torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/nightly/cpu
+   ```
+4. **Install project dependencies:**
    ```sh
    pip install -r requirements.txt
    ```
 
-### Usage
+## Usage
 
-Instructions for running the app will be added after refactoring for MPS.
+To start the Gradio interface:
+```sh
+python demo_gradio.py
+```
 
-## Project Plan
+- Upload an image and enter a prompt to generate video.
+- Monitor memory usage and debug logs in the UI.
+- Use `--fp32` if you encounter float16/bfloat16 issues on your hardware.
+- Use `--debug` for detailed logging.
 
-See `docs/project_plan.md` for the detailed project plan and progress.
-
----
-
-## Acknowledgments
-
-- [FramePack by Hugging Face](https://github.com/huggingface/FramePack)
-- [Mac fork contributors](link-to-fork-if-available)
-- (More details and credits to be added as the project progresses.)
-
----
+## Key Features
+- Apple Silicon/MPS-first design
+- Real-time memory and swap monitoring
+- Modern Gradio UI with activity spinner and debug panel
+- Clean, CUDA-free codebase
+- Comprehensive documentation and changelog
 
 ## License
 
-[Specify your license here]
+This project is licensed under the Apache-2.0 license, following the original FramePack repositories.
+
+## Further Reading
+- [Original FramePack Paper](https://lllyasviel.github.io/frame_pack_gitpage/pack.pdf)
+- [Project Page](https://lllyasviel.github.io/frame_pack_gitpage/)
+- [CHANGELOG.md](./CHANGELOG.md) for recent updates
+- [docs/README.md](./docs/README.md) for project documentation overview
 
 ---
 
-*This README will be updated as development progresses.*
+_This project is under active development. Contributions, feedback, and issues are welcome!_
 
 <p align="center">
     <img src="https://github.com/user-attachments/assets/2cc030b4-87e1-40a0-b5bf-1b7d6b62820b" width="300">

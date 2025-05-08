@@ -18,6 +18,10 @@ def main():
     import os
     import psutil
     os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+    if os.environ.get("PYTORCH_MPS_HIGH_WATERMARK_RATIO") is None:
+        print("[INFO] For best memory usage on Apple Silicon, set PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0 in your shell before running this app.")
+        print("       Example: export PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0")
+        print("       See README for more details.")
     import gradio as gr
     import torch
     import traceback
@@ -141,14 +145,22 @@ def main():
         torch_dtype=torch.float16
     )
     move_model_to_device(vae, device)
+    # Enable VAE slicing/tiling if available
+    if hasattr(vae, 'enable_slicing'):
+        vae.enable_slicing()
+    if hasattr(vae, 'enable_tiling'):
+        vae.enable_tiling()
     log_full_memory_status(logger)
 
     print("Loading transformer from lllyasviel/FramePackI2V_HY ...")
     transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained(
         'lllyasviel/FramePackI2V_HY', 
-        torch_dtype=torch.bfloat16
+        torch_dtype=torch.float16
     )
     move_model_to_device(transformer, device)
+    # Enable attention slicing if available
+    if hasattr(transformer, 'enable_attention_slicing'):
+        transformer.enable_attention_slicing()
     log_full_memory_status(logger)
 
     vae.eval()
@@ -162,7 +174,7 @@ def main():
         for model in models_to_convert:
             model.to(dtype=torch.float32)
     else:
-        transformer.to(dtype=torch.bfloat16)
+        transformer.to(dtype=torch.float16)
         vae.to(dtype=torch.float16)
 
     for model in [vae, text_encoder, text_encoder_2]:
@@ -198,6 +210,11 @@ def main():
 
             llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
 
+            # Offload text encoders after use
+            offload_model_to_cpu(text_encoder)
+            offload_model_to_cpu(text_encoder_2)
+            log_full_memory_status(logger)
+
             if cfg == 1:
                 llama_vec_n, clip_l_pooler_n = torch.zeros_like(llama_vec), torch.zeros_like(clip_l_pooler)
             else:
@@ -219,7 +236,11 @@ def main():
 
             stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'VAE encoding ...'))))
 
+            move_model_to_device(vae, device)
             start_latent = vae_encode(input_image_pt, vae)
+            # Offload VAE after encoding
+            offload_model_to_cpu(vae)
+            log_full_memory_status(logger)
 
             stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'CLIP Vision encoding ...'))))
 
@@ -230,6 +251,7 @@ def main():
 
             stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Start sampling ...'))))
             log_full_memory_status(logger)
+            move_model_to_device(transformer, device)
             rnd = torch.Generator("cpu").manual_seed(seed)
             num_frames = latent_window_size * 4 - 3
 
@@ -323,12 +345,18 @@ def main():
                 real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
 
                 if history_pixels is None:
+                    move_model_to_device(vae, device)
                     history_pixels = vae_decode(real_history_latents, vae).cpu()
+                    offload_model_to_cpu(vae)
+                    log_full_memory_status(logger)
                 else:
                     section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
                     overlapped_frames = latent_window_size * 4 - 3
 
+                    move_model_to_device(vae, device)
                     current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae).cpu()
+                    offload_model_to_cpu(vae)
+                    log_full_memory_status(logger)
                     history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
 
                 output_filename = os.path.join(outputs_folder, f'{job_id}_{total_generated_latent_frames}.mp4')
@@ -341,6 +369,8 @@ def main():
 
                 if is_last_section:
                     break
+            # Offload transformer after sampling
+            offload_model_to_cpu(transformer)
             log_full_memory_status(logger)
         except:
             traceback.print_exc()
@@ -421,6 +451,7 @@ def main():
                 preview_image = gr.Image(label="Next Latents", height=200, visible=False)
                 result_video = gr.Video(label="Finished Frames", autoplay=True, show_share_button=False, height=512, loop=True)
                 gr.Markdown('Note that the ending actions will be generated before the starting actions due to the inverted sampling. If the starting action is not in the video, you just need to wait, and it will be generated later.')
+                gr.Markdown('**Tip:** If you encounter memory errors or crashes, try lowering the Resolution, Total Video Length, or Latent Window Size sliders. This will reduce memory usage and help the app run on Macs with less RAM.')
                 progress_desc = gr.Markdown('', elem_classes='no-generating-animation')
                 progress_bar = gr.HTML('', elem_classes='no-generating-animation')
                 debug_panel = gr.Textbox(label="Debug/Status Log", value="", lines=8, interactive=False)

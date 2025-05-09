@@ -12,7 +12,56 @@ parser.add_argument('--output_dir', type=str, default='./outputs', help='Directo
 parser.add_argument('--fp32', action='store_true', default=False, help='Use float32 precision for models (recommended for some M1/M2 chips)')
 parser.add_argument('--debug', action='store_true', help='Enable debug mode (allows CPU fallback if MPS unavailable, extra logging)')
 parser.add_argument('--verbose', action='store_true', help='Enable verbose logging (more detailed logs in terminal)')
+
+# New: Global quality preset
+parser.add_argument('--quality', choices=['high', 'medium', 'low'], help='Set global quality/speed/memory preset')
+
+# New: Per-component precision/device/unload flags
+for comp in ['tokenizer', 'text_encoder', 'vae', 'transformer']:
+    parser.add_argument(f'--{comp}-precision', choices=['fp16', 'fp8', 'fp32'], help=f'Precision for {comp}')
+    parser.add_argument(f'--{comp}-device', choices=['mps', 'cpu'], help=f'Device for {comp}')
+    parser.add_argument(f'--{comp}-unload', action='store_true', help=f'Unload {comp} after use to save memory')
+
 args = parser.parse_args()
+
+# Helper: resolve effective settings for each component
+QUALITY_PRESETS = {
+    'high': {
+        'tokenizer':  {'precision': 'fp32', 'device': 'cpu', 'unload': False},
+        'vae': {'precision': 'fp16', 'device': 'mps', 'unload': False},
+        'text_encoder': {'precision': 'fp16', 'device': 'mps', 'unload': False},
+        'transformer': {'precision': 'fp16', 'device': 'mps', 'unload': False},
+    },
+    'medium': {
+        'tokenizer':  {'precision': 'fp32', 'device': 'cpu', 'unload': True},
+        'vae': {'precision': 'fp16', 'device': 'mps', 'unload': True},
+        'text_encoder': {'precision': 'fp16', 'device': 'mps', 'unload': True},
+        'transformer': {'precision': 'fp16', 'device': 'mps', 'unload': True},
+    },
+    'low': {
+        'tokenizer':  {'precision': 'fp32', 'device': 'cpu', 'unload': True},
+        'vae': {'precision': 'fp8', 'device': 'cpu', 'unload': True},
+        'text_encoder': {'precision': 'fp8', 'device': 'cpu', 'unload': True},
+        'transformer': {'precision': 'fp16', 'device': 'mps', 'unload': True},  # FP8 not supported on MPS
+    },
+}
+
+def get_component_setting(comp):
+    # Start with quality preset if set
+    preset = QUALITY_PRESETS.get(args.quality, {})
+    # For text_encoder_2 and tokenizer_2, always use the same settings as text_encoder and tokenizer
+    if comp == 'text_encoder_2':
+        comp = 'text_encoder'
+    if comp == 'tokenizer_2':
+        comp = 'tokenizer'
+    base = preset.get(comp, {})
+    # Override with explicit CLI flags if provided
+    precision = getattr(args, f'{comp}_precision', None) or base.get('precision')
+    device = getattr(args, f'{comp}_device', None) or base.get('device')
+    unload = getattr(args, f'{comp}_unload', None)
+    if unload is None:
+        unload = base.get('unload', False)
+    return {'precision': precision, 'device': device, 'unload': unload}
 
 def main():
     import os
@@ -106,79 +155,84 @@ def main():
         else:
             print(msg)
 
-    print("Loading text_encoder from hunyuanvideo-community/HunyuanVideo (subfolder: text_encoder)...")
-    text_encoder = LlamaModel.from_pretrained(
-        "hunyuanvideo-community/HunyuanVideo",
-        subfolder='text_encoder',
-        torch_dtype=torch.float16
-    )
-    move_model_to_device(text_encoder, device)
-    log_full_memory_status(logger)
+    # --- Model Loader Utility ---
+    def resolve_torch_dtype(precision):
+        if precision == 'fp16':
+            return torch.float16
+        elif precision == 'fp32':
+            return torch.float32
+        elif precision == 'fp8':
+            # PyTorch FP8 support is experimental and not available on MPS; only use on CPU
+            try:
+                return torch.float8_e4m3fn
+            except AttributeError:
+                raise RuntimeError('FP8 not supported in this PyTorch build')
+        else:
+            return torch.float16  # fallback
 
-    print("Loading text_encoder_2 from hunyuanvideo-community/HunyuanVideo (subfolder: text_encoder_2)...")
-    text_encoder_2 = CLIPTextModel.from_pretrained(
-        "hunyuanvideo-community/HunyuanVideo", 
-        subfolder='text_encoder_2', 
-        torch_dtype=torch.float16
-    )
-    move_model_to_device(text_encoder_2, device)
-    log_full_memory_status(logger)
+    def load_model(component, model_id, subfolder=None):
+        settings = get_component_setting(component)
+        dtype = resolve_torch_dtype(settings['precision'])
+        device_str = settings['device']
+        # Only create device_obj if needed
+        if component in ['text_encoder', 'text_encoder_2', 'vae', 'transformer']:
+            device_obj = torch.device(device_str or 'cpu')
+        print(f"[INFO] Loading {component} from {model_id} (subfolder: {subfolder}) as {settings['precision']} on {device_str}")
+        if component == 'text_encoder':
+            model = LlamaModel.from_pretrained(model_id, subfolder=subfolder, torch_dtype=dtype)
+            model.to(device_obj)
+        elif component == 'text_encoder_2':
+            model = CLIPTextModel.from_pretrained(model_id, subfolder=subfolder, torch_dtype=dtype)
+            model.to(device_obj)
+        elif component == 'vae':
+            model = AutoencoderKLHunyuanVideo.from_pretrained(model_id, subfolder=subfolder, torch_dtype=dtype)
+            model.to(device_obj)
+        elif component == 'transformer':
+            model = HunyuanVideoTransformer3DModelPacked.from_pretrained(model_id, torch_dtype=dtype)
+            model.to(device_obj)
+        elif component == 'tokenizer':
+            model = LlamaTokenizerFast.from_pretrained(model_id, subfolder=subfolder)
+        elif component == 'tokenizer_2':
+            model = CLIPTokenizer.from_pretrained(model_id, subfolder=subfolder)
+        else:
+            raise ValueError(f"Unknown component: {component}")
+        log_full_memory_status(logger)
+        return model
 
-    print("Loading tokenizer from hunyuanvideo-community/HunyuanVideo (subfolder: tokenizer)...")
-    tokenizer = LlamaTokenizerFast.from_pretrained(
-        "hunyuanvideo-community/HunyuanVideo", 
-        subfolder='tokenizer'
-    )
-    log_full_memory_status(logger)
+    def unload_model(model, component):
+        print(f"[INFO] Unloading {component} from memory")
+        del model
+        torch.mps.empty_cache()
+        log_full_memory_status(logger)
 
-    print("Loading tokenizer_2 from hunyuanvideo-community/HunyuanVideo (subfolder: tokenizer_2)...")
-    tokenizer_2 = CLIPTokenizer.from_pretrained(
-        "hunyuanvideo-community/HunyuanVideo", 
-        subfolder='tokenizer_2'
-    )
-    log_full_memory_status(logger)
+    # --- Pipeline Refactor: Lazy Load/Unload ---
+    # Tokenizers (always on CPU, usually fp32)
+    tokenizer = load_model('tokenizer', "hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer')
+    tokenizer_2 = load_model('tokenizer_2', "hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer_2')
 
-    print("Loading vae from hunyuanvideo-community/HunyuanVideo (subfolder: vae)...")
-    vae = AutoencoderKLHunyuanVideo.from_pretrained(
-        "hunyuanvideo-community/HunyuanVideo", 
-        subfolder='vae', 
-        torch_dtype=torch.float16
-    )
-    move_model_to_device(vae, device)
-    # Enable VAE slicing/tiling if available
-    if hasattr(vae, 'enable_slicing'):
-        vae.enable_slicing()
-    if hasattr(vae, 'enable_tiling'):
-        vae.enable_tiling()
-    log_full_memory_status(logger)
+    def get_text_encoders():
+        text_encoder = load_model('text_encoder', "hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder')
+        text_encoder.eval()
+        text_encoder_2 = load_model('text_encoder_2', "hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder_2')
+        text_encoder_2.eval()
+        return text_encoder, text_encoder_2
 
-    print("Loading transformer from lllyasviel/FramePackI2V_HY ...")
-    transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained(
-        'lllyasviel/FramePackI2V_HY', 
-        torch_dtype=torch.float16
-    )
-    move_model_to_device(transformer, device)
-    # Enable attention slicing if available
-    if hasattr(transformer, 'enable_attention_slicing'):
-        transformer.enable_attention_slicing()
-    log_full_memory_status(logger)
+    def get_vae():
+        vae = load_model('vae', "hunyuanvideo-community/HunyuanVideo", subfolder='vae')
+        vae.eval()
+        # Enable VAE slicing/tiling if available
+        if hasattr(vae, 'enable_slicing'):
+            vae.enable_slicing()
+        if hasattr(vae, 'enable_tiling'):
+            vae.enable_tiling()
+        return vae
 
-    vae.eval()
-    text_encoder.eval()
-    text_encoder_2.eval()
-    transformer.eval()
-
-    if args.fp32:
-        logger.info('Using float32 for transformer and encoder models')
-        models_to_convert = [transformer, vae]
-        for model in models_to_convert:
-            model.to(dtype=torch.float32)
-    else:
-        transformer.to(dtype=torch.float16)
-        vae.to(dtype=torch.float16)
-
-    for model in [vae, text_encoder, text_encoder_2]:
-        model.requires_grad_(False)
+    def get_transformer():
+        transformer = load_model('transformer', 'lllyasviel/FramePackI2V_HY')
+        transformer.eval()
+        if hasattr(transformer, 'enable_attention_slicing'):
+            transformer.enable_attention_slicing()
+        return transformer
 
     stream = AsyncStream()
 
@@ -199,26 +253,27 @@ def main():
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...'))))
 
         try:
-            unload_complete_models(
-                text_encoder, text_encoder_2, transformer
-            )
-
-            stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Text encoding ...'))))
-
-            fake_diffusers_current_device(text_encoder, device)
-            load_model_as_complete(text_encoder_2, target_device=device)
-
+            # --- Text Encoding ---
+            text_encoder, text_encoder_2 = get_text_encoders()
+            fake_diffusers_current_device(text_encoder, torch.device(get_component_setting('text_encoder')['device']))
+            fake_diffusers_current_device(text_encoder_2, torch.device(get_component_setting('text_encoder')['device']))
             llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
-
-            # Offload text encoders after use
-            offload_model_to_cpu(text_encoder)
-            offload_model_to_cpu(text_encoder_2)
+            if get_component_setting('text_encoder')['unload']:
+                unload_model(text_encoder, 'text_encoder')
+            if get_component_setting('text_encoder_2')['unload']:
+                unload_model(text_encoder_2, 'text_encoder_2')
             log_full_memory_status(logger)
 
             if cfg == 1:
                 llama_vec_n, clip_l_pooler_n = torch.zeros_like(llama_vec), torch.zeros_like(clip_l_pooler)
             else:
+                # Reload text encoders for negative prompt if needed
+                text_encoder, text_encoder_2 = get_text_encoders()
                 llama_vec_n, clip_l_pooler_n = encode_prompt_conds(n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+                if get_component_setting('text_encoder')['unload']:
+                    unload_model(text_encoder, 'text_encoder')
+                if get_component_setting('text_encoder_2')['unload']:
+                    unload_model(text_encoder_2, 'text_encoder_2')
 
             llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
             llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
@@ -236,14 +291,16 @@ def main():
 
             stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'VAE encoding ...'))))
 
-            move_model_to_device(vae, device)
+            vae = get_vae()
             start_latent = vae_encode(input_image_pt, vae)
-            # Offload VAE after encoding
-            offload_model_to_cpu(vae)
+            if get_component_setting('vae')['unload']:
+                unload_model(vae, 'vae')
             log_full_memory_status(logger)
 
             stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'CLIP Vision encoding ...'))))
 
+            # Prepare for transformer
+            transformer = get_transformer()
             llama_vec = llama_vec.to(transformer.dtype)
             llama_vec_n = llama_vec_n.to(transformer.dtype)
             clip_l_pooler = clip_l_pooler.to(transformer.dtype)
@@ -251,7 +308,6 @@ def main():
 
             stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Start sampling ...'))))
             log_full_memory_status(logger)
-            move_model_to_device(transformer, device)
             rnd = torch.Generator("cpu").manual_seed(seed)
             num_frames = latent_window_size * 4 - 3
 
@@ -323,7 +379,7 @@ def main():
                     negative_prompt_embeds=llama_vec_n,
                     negative_prompt_embeds_mask=llama_attention_mask_n,
                     negative_prompt_poolers=clip_l_pooler_n,
-                    device=device,
+                    device=torch.device(get_component_setting('transformer')['device']),
                     dtype=transformer.dtype,
                     image_embeddings=None,
                     latent_indices=latent_indices,
@@ -345,17 +401,19 @@ def main():
                 real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
 
                 if history_pixels is None:
-                    move_model_to_device(vae, device)
+                    vae = get_vae()
                     history_pixels = vae_decode(real_history_latents, vae).cpu()
-                    offload_model_to_cpu(vae)
+                    if get_component_setting('vae')['unload']:
+                        unload_model(vae, 'vae')
                     log_full_memory_status(logger)
                 else:
                     section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
                     overlapped_frames = latent_window_size * 4 - 3
 
-                    move_model_to_device(vae, device)
+                    vae = get_vae()
                     current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae).cpu()
-                    offload_model_to_cpu(vae)
+                    if get_component_setting('vae')['unload']:
+                        unload_model(vae, 'vae')
                     log_full_memory_status(logger)
                     history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
 
@@ -369,8 +427,8 @@ def main():
 
                 if is_last_section:
                     break
-            # Offload transformer after sampling
-            offload_model_to_cpu(transformer)
+            if get_component_setting('transformer')['unload']:
+                unload_model(transformer, 'transformer')
             log_full_memory_status(logger)
         except:
             traceback.print_exc()

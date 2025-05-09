@@ -795,6 +795,12 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
             result = block(*args)
         return result
 
+    def ensure_clean_x_embedder(self):
+        if self.clean_x_embedder is None:
+            print("[WARN] clean_x_embedder is None, reloading via install_clean_x_embedder()...")
+            self.install_clean_x_embedder()
+        return self.clean_x_embedder
+
     def process_input_hidden_states(
             self,
             latents, latent_indices=None,
@@ -815,7 +821,8 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
 
         if clean_latents is not None and clean_latent_indices is not None:
             clean_latents = clean_latents.to(hidden_states)
-            clean_latents = self.gradient_checkpointing_method(self.clean_x_embedder.proj, clean_latents)
+            clean_x_embedder = self.ensure_clean_x_embedder()
+            clean_latents = self.gradient_checkpointing_method(clean_x_embedder.proj, clean_latents)
             clean_latents = clean_latents.flatten(2).transpose(1, 2)
 
             clean_latent_rope_freqs = self.rope(frame_indices=clean_latent_indices, height=H, width=W, device=clean_latents.device)
@@ -826,8 +833,9 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
 
         if clean_latents_2x is not None and clean_latent_2x_indices is not None:
             clean_latents_2x = clean_latents_2x.to(hidden_states)
+            clean_x_embedder = self.ensure_clean_x_embedder()
             clean_latents_2x = pad_for_3d_conv(clean_latents_2x, (2, 4, 4))
-            clean_latents_2x = self.gradient_checkpointing_method(self.clean_x_embedder.proj_2x, clean_latents_2x)
+            clean_latents_2x = self.gradient_checkpointing_method(clean_x_embedder.proj_2x, clean_latents_2x)
             clean_latents_2x = clean_latents_2x.flatten(2).transpose(1, 2)
 
             clean_latent_2x_rope_freqs = self.rope(frame_indices=clean_latent_2x_indices, height=H, width=W, device=clean_latents_2x.device)
@@ -840,8 +848,9 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
 
         if clean_latents_4x is not None and clean_latent_4x_indices is not None:
             clean_latents_4x = clean_latents_4x.to(hidden_states)
+            clean_x_embedder = self.ensure_clean_x_embedder()
             clean_latents_4x = pad_for_3d_conv(clean_latents_4x, (4, 8, 8))
-            clean_latents_4x = self.gradient_checkpointing_method(self.clean_x_embedder.proj_4x, clean_latents_4x)
+            clean_latents_4x = self.gradient_checkpointing_method(clean_x_embedder.proj_4x, clean_latents_4x)
             clean_latents_4x = clean_latents_4x.flatten(2).transpose(1, 2)
 
             clean_latent_4x_rope_freqs = self.rope(frame_indices=clean_latent_4x_indices, height=H, width=W, device=clean_latents_4x.device)
@@ -853,6 +862,14 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
             rope_freqs = torch.cat([clean_latent_4x_rope_freqs, rope_freqs], dim=1)
 
         return hidden_states, rope_freqs
+
+    def ensure_image_projection(self):
+        if self.image_projection is None:
+            print("[WARN] image_projection is None, reloading via install_image_projection()...")
+            # Use the config value for image_proj_dim if available, else fallback to self.inner_dim
+            image_proj_dim = self.config.get('image_proj_dim', self.inner_dim)
+            self.install_image_projection(image_proj_dim)
+        return self.image_projection
 
     def forward(
             self,
@@ -882,7 +899,8 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
 
         if self.image_projection is not None:
             assert image_embeddings is not None, 'You must use image embeddings!'
-            extra_encoder_hidden_states = self.gradient_checkpointing_method(self.image_projection, image_embeddings)
+            image_projection = self.ensure_image_projection()
+            extra_encoder_hidden_states = self.gradient_checkpointing_method(image_projection, image_embeddings)
             extra_attention_mask = torch.ones((batch_size, extra_encoder_hidden_states.shape[1]), dtype=encoder_attention_mask.dtype, device=encoder_attention_mask.device)
 
             # must cat before (not after) encoder_hidden_states, due to attn masking

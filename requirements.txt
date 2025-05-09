@@ -1,3 +1,7 @@
+# DO NOT specify torch or torchvision here!
+# Install torch, torchvision, and torchaudio separately from the Apple nightly channel for MPS support.
+# See README for details.
+
 accelerate==1.6.0
 diffusers==0.33.1
 transformers==4.46.2

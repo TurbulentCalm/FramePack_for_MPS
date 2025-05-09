@@ -34,9 +34,9 @@ FramePack is a next-frame prediction neural network for video generation, design
 ## Requirements
 
 - macOS with Apple Silicon (M1/M2/M3)
-- Python 3.10 (recommended)
-- [Conda](https://docs.conda.io/en/latest/) for environment management (optional but recommended)
-- PyTorch with MPS support
+- **Python 3.10 (required for MPS support; do not use 3.11/3.12)**
+- [Conda](https://docs.conda.io/en/latest/) for environment management (recommended)
+- PyTorch with MPS support (install from Apple nightly channel)
 - Sufficient disk space for model downloads (30GB+)
 
 ## Installation
@@ -46,19 +46,43 @@ FramePack is a next-frame prediction neural network for video generation, design
    git clone <repo-url>
    cd FramePack_for_MPS
    ```
-2. **(Optional) Create and activate a conda environment:**
+2. **Create and activate a conda environment with Python 3.10:**
    ```sh
    conda create -n framepack python=3.10
    conda activate framepack
    ```
-3. **Install PyTorch with MPS support:**
+3. **Install PyTorch, torchvision, and torchaudio from the Apple nightly channel:**
    ```sh
    pip install --pre torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/nightly/cpu
    ```
+   - **Do NOT install torch/torchvision from conda or regular pip channels.**
+   - **Do NOT specify torch/torchvision in requirements.txt.**
 4. **Install project dependencies:**
    ```sh
    pip install -r requirements.txt
    ```
+
+## Troubleshooting
+- If you see errors about MPS or Apple Silicon, check your Python version (must be 3.10) and that you installed PyTorch from the nightly channel.
+- Avoid mixing pip and conda for core packages (torch, torchvision, numpy, etc.).
+- If you have a version conflict, recreate your environment from scratch as above.
+
+## Keeping Your Environment Up to Date
+
+To update PyTorch, torchvision, and torchaudio to the latest Apple nightly builds:
+```sh
+pip install --upgrade --pre torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/nightly/cpu
+```
+
+To update all other dependencies to the latest versions specified in requirements.txt:
+```sh
+pip install --upgrade -r requirements.txt
+```
+
+**Note:**
+- Always update PyTorch, torchvision, and torchaudio together to avoid version mismatches.
+- If you encounter version conflicts, recreate your environment from scratch as described above.
+- Avoid using `conda update` for core packages (torch, torchvision, numpy, etc.) in this workflow—use pip as shown above for the Apple nightly stack.
 
 ## Usage
 
